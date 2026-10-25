@@ -316,17 +316,18 @@ def consensus_height(heights):
     """Pick the network's block height from what nodes reported at handshake.
 
     Nodes report their height at the moment we connected, and a crawl lasts
-    ~20 minutes (2 or so new blocks), so values cluster a few blocks apart.
-    Lagging/syncing nodes report much lower numbers and a few broken nodes
-    report absurd ones. Strategy: take the most common height among nodes
-    within 6 blocks of the 99th-percentile height.
+    10-20 minutes (1-2 new blocks), so honest values cluster a few blocks
+    apart. Some fake/spy nodes all report the same bogus height, so we must
+    not trust the highest values. Strategy: slide a 3-block window over the
+    reported heights and pick the window holding the most nodes; its top
+    end is the consensus height. A minority cluster can never win.
     """
-    valid = sorted(h for h in heights if h > 0)
-    if not valid:
+    counts = Counter(h for h in heights if h > 0)
+    if not counts:
         return 0
-    top = valid[int(len(valid) * 0.99) - 1 if len(valid) > 1 else 0]
-    near_tip = [h for h in valid if top - 6 <= h <= top]
-    return Counter(near_tip).most_common(1)[0][0]
+    def support(h):
+        return counts[h] + counts[h - 1] + counts[h - 2]
+    return max(counts, key=lambda h: (support(h), h))
 
 
 def build_rows(reachable):
