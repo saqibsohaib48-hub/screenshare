@@ -41,7 +41,8 @@ CONNECT_TIMEOUT = float(os.environ.get("CONNECT_TIMEOUT", "6"))
 HANDSHAKE_TIMEOUT = 10
 GETADDR_TIMEOUT = 12
 MAX_ADDR_AGE = 3 * 86400        # ignore gossiped addresses older than 3 days
-HISTORY_LIMIT = 5000            # points kept in history.json
+HISTORY_FULL_DAYS = 7           # keep every crawl for this many days...
+HISTORY_BUCKET = 3 * 3600       # ...then one point per 3 hours, kept forever
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
@@ -355,6 +356,24 @@ def build_rows(reachable):
     return rows
 
 
+def compact_history(history, now):
+    """Keep every point from the last week; older points thin out to one per
+    3-hour bucket. Nothing is ever dropped completely, so long-term trends survive
+    while the file stays small (~1 MB per year at 15-minute crawls)."""
+    cutoff = now - HISTORY_FULL_DAYS * 86400
+    kept, seen_buckets = [], set()
+    for point in history:
+        t = point[0] if isinstance(point, list) else point["t"]
+        if t >= cutoff:
+            kept.append(point)
+            continue
+        bucket = t // HISTORY_BUCKET
+        if bucket not in seen_buckets:
+            seen_buckets.add(bucket)
+            kept.append(point)
+    return kept
+
+
 def fetch_chain_tip() -> int:
     """Current block height from public explorers (0 if none answer)."""
     import urllib.request
@@ -408,10 +427,13 @@ def main():
     except (FileNotFoundError, json.JSONDecodeError):
         history = []
     if rows:  # never record an empty crawl (e.g. network failure) as "0 nodes"
-        # t=time, n=nodes, h=height, s=in sync, k=Knots nodes, cc=nodes per country
-        history.append({"t": now, "n": len(rows), "h": height, "s": in_sync,
-                        "k": knots, "cc": countries})
-    history_file.write_text(json.dumps(history[-HISTORY_LIMIT:], separators=(",", ":")))
+        # t=time, n=nodes, h=height, s=in sync, k=Knots nodes, f=full nodes,
+        # c=number of countries, cc=nodes per country (top 25)
+        full = sum(1 for r in rows if r[4] & 1)
+        history.append({"t": now, "n": len(rows), "h": height, "s": in_sync, "k": knots,
+                        "f": full, "c": len({r[6] for r in rows if r[6]}), "cc": countries})
+    history = compact_history(history, now)
+    history_file.write_text(json.dumps(history, separators=(",", ":")))
 
     print(f"Chain tip from explorer: {tip or 'unavailable'} | node consensus: {consensus} "
           f"| in sync: {in_sync}/{len(rows)}")
