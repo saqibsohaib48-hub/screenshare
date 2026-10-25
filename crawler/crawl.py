@@ -355,13 +355,34 @@ def build_rows(reachable):
     return rows
 
 
+def fetch_chain_tip() -> int:
+    """Current block height from public explorers (0 if none answer)."""
+    import urllib.request
+    for url in ("https://mempool.space/api/blocks/tip/height",
+                "https://blockstream.info/api/blocks/tip/height"):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "nodescope-crawler"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return int(resp.read().strip())
+        except Exception as exc:
+            print(f"  tip from {url}: {exc}")
+    return 0
+
+
 # ---------------------------------------------------------------- main
 def main():
     started = time.time()
     print(f"Crawling for up to {CRAWL_SECONDS}s with {CONCURRENCY} connections")
     reachable, attempted = asyncio.run(crawl())
     rows = build_rows(reachable)
-    height = consensus_height([r[5] for r in rows])
+    consensus = consensus_height([r[5] for r in rows])
+    tip = fetch_chain_tip()
+    # Trust an independent explorer when it roughly agrees with the nodes;
+    # otherwise fall back to what the majority of nodes reported.
+    height = tip if tip and abs(tip - consensus) < 2000 else consensus
+    in_sync = sum(1 for r in rows if height - 6 <= r[5] <= height + 2)
+    knots = sum(1 for r in rows if "knots" in r[2].lower())
+    countries = dict(Counter(r[6] for r in rows if r[6]).most_common(25))
     now = int(time.time())
 
     snapshot = {
@@ -370,6 +391,10 @@ def main():
         "attempted": attempted,
         "total": len(rows),
         "height": height,
+        "consensus": consensus,
+        "tip": tip,
+        "in_sync": in_sync,
+        "knots": knots,
         "columns": ["ip", "port", "user_agent", "protocol", "services", "height",
                     "country_code", "country", "city", "lat", "lon", "asn", "org"],
         "nodes": rows,
@@ -383,9 +408,13 @@ def main():
     except (FileNotFoundError, json.JSONDecodeError):
         history = []
     if rows:  # never record an empty crawl (e.g. network failure) as "0 nodes"
-        history.append([now, len(rows), height])
+        # t=time, n=nodes, h=height, s=in sync, k=Knots nodes, cc=nodes per country
+        history.append({"t": now, "n": len(rows), "h": height, "s": in_sync,
+                        "k": knots, "cc": countries})
     history_file.write_text(json.dumps(history[-HISTORY_LIMIT:], separators=(",", ":")))
 
+    print(f"Chain tip from explorer: {tip or 'unavailable'} | node consensus: {consensus} "
+          f"| in sync: {in_sync}/{len(rows)}")
     print(f"Done: {len(rows)} reachable nodes, height {height}, "
           f"{attempted} addresses tried, {now - started:.0f}s")
 
