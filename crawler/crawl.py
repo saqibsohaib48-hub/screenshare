@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""
+NodeScope crawler - discovers reachable Bitcoin nodes over the P2P network.
+
+How it works
+  1. Resolve the Bitcoin DNS seeds to get a starting set of node IPs.
+  2. Connect to each node, perform the version/verack handshake (this tells us
+     the node's software, protocol version, services and block height).
+  3. Send `getaddr` and collect the peer addresses the node returns.
+  4. Queue every new address and repeat until the time budget runs out.
+
+Output
+  data/latest.json   full snapshot of reachable nodes (deployed with the site)
+  data/history.json  small time series [timestamp, nodes, height] (committed)
+
+Only the Python standard library is required. If `maxminddb` is installed and
+DB-IP Lite databases exist in ./geo, nodes are geolocated (country, city, ASN).
+"""
+
+import asyncio
+import hashlib
+import ipaddress
+import json
+import os
+import random
+import socket
+import struct
+import time
+from collections import Counter
+from pathlib import Path
+
+# ---------------------------------------------------------------- settings
+MAGIC = bytes.fromhex("f9beb4d9")          # Bitcoin mainnet
+PROTOCOL_VERSION = 70016
+USER_AGENT = b"/nodescope-crawler:0.1/"
+DEFAULT_PORT = 8333
+
+CRAWL_SECONDS = int(os.environ.get("CRAWL_SECONDS", "1200"))  # time budget
+CONCURRENCY = int(os.environ.get("CONCURRENCY", "400"))      # parallel sockets
+CONNECT_TIMEOUT = float(os.environ.get("CONNECT_TIMEOUT", "6"))
+HANDSHAKE_TIMEOUT = 10
+GETADDR_TIMEOUT = 12
+MAX_ADDR_AGE = 3 * 86400        # ignore gossiped addresses older than 3 days
+HISTORY_LIMIT = 5000            # points kept in history.json
+
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT / "data"
+GEO_DIR = ROOT / "geo"
+
+DNS_SEEDS = [
+    "seed.bitcoin.sipa.be",
+    "dnsseed.bluematt.me",
+    "dnsseed.bitcoin.dashjr-list-of-p2p-nodes.us",
+    "seed.bitcoinstats.com",
+    "seed.bitcoin.jonasschnelli.ch",
+    "seed.btc.petertodd.net",
+    "seed.bitcoin.sprovoost.nl",
+    "dnsseed.emzy.de",
+    "seed.bitcoin.wiz.biz",
+    "seed.mainnet.achownodes.xyz",
+]
+
+ONIONCAT_PREFIX = bytes.fromhex("fd87d87eeb43")  # Tor v2 over addr v1 - skip
+
+
+# ---------------------------------------------------------------- wire format
+def sha256d(b: bytes) -> bytes:
+    return hashlib.sha256(hashlib.sha256(b).digest()).digest()
+
+
+def make_msg(command: str, payload: bytes = b"") -> bytes:
+    return (MAGIC + command.encode().ljust(12, b"\0")
+            + struct.pack("<I", len(payload)) + sha256d(payload)[:4] + payload)
+
+
+def varint(n: int) -> bytes:
+    if n < 0xFD:
+        return bytes([n])
+    if n <= 0xFFFF:
+        return b"\xfd" + struct.pack("<H", n)
+    if n <= 0xFFFFFFFF:
+        return b"\xfe" + struct.pack("<I", n)
+    return b"\xff" + struct.pack("<Q", n)
+
+
+def read_varint(buf: bytes, off: int):
+    first = buf[off]
+    if first < 0xFD:
+        return first, off + 1
+    if first == 0xFD:
+        return struct.unpack_from("<H", buf, off + 1)[0], off + 3
+    if first == 0xFE:
+        return struct.unpack_from("<I", buf, off + 1)[0], off + 5
+    return struct.unpack_from("<Q", buf, off + 1)[0], off + 9
+
+
+def ip_to_16(ip: str) -> bytes:
+    addr = ipaddress.ip_address(ip)
+    if addr.version == 4:
+        return b"\0" * 10 + b"\xff\xff" + addr.packed
+    return addr.packed
+
+
+def ip_from_16(raw: bytes):
+    """Return a printable IP, or None for onion/non-routable addresses."""
+    if raw[:6] == ONIONCAT_PREFIX:
+        return None
+    if raw[:12] == b"\0" * 10 + b"\xff\xff":
+        addr = ipaddress.IPv4Address(raw[12:])
+    else:
+        addr = ipaddress.IPv6Address(raw)
+    return str(addr) if addr.is_global else None
+
+
+def version_payload(ip: str, port: int) -> bytes:
+    return (struct.pack("<iQq", PROTOCOL_VERSION, 0, int(time.time()))
+            + struct.pack("<Q", 0) + ip_to_16(ip) + struct.pack(">H", port)  # addr_recv
+            + struct.pack("<Q", 0) + b"\0" * 16 + struct.pack(">H", 0)       # addr_from
+            + os.urandom(8)                                                  # nonce
+            + varint(len(USER_AGENT)) + USER_AGENT
+            + struct.pack("<i", 0)                                           # start_height
+            + b"\x00")                                                       # relay = false
+
+
+def parse_version(p: bytes) -> dict:
+    version, services, _ts = struct.unpack_from("<iQq", p, 0)
+    off = 20 + 26 + 26 + 8            # skip addr_recv, addr_from, nonce
+    ua_len, off = read_varint(p, off)
+    ua = p[off:off + ua_len].decode("utf-8", errors="replace")[:120]
+    off += ua_len
+    height = struct.unpack_from("<i", p, off)[0] if len(p) >= off + 4 else 0
+    return {"protocol": version, "services": services, "ua": ua, "height": height}
+
+
+def parse_addr(p: bytes):
+    count, off = read_varint(p, 0)
+    out = []
+    for _ in range(min(count, 1000)):
+        if off + 30 > len(p):
+            break
+        ts = struct.unpack_from("<I", p, off)[0]
+        ip = ip_from_16(p[off + 12:off + 28])
+        port = struct.unpack_from(">H", p, off + 28)[0]
+        off += 30
+        if ip and port:
+            out.append((ts, ip, port))
+    return out
+
+
+async def read_msg(reader):
+    header = await reader.readexactly(24)
+    if header[:4] != MAGIC:
+        raise ValueError("bad magic")
+    command = header[4:16].rstrip(b"\0").decode("ascii", errors="replace")
+    length = struct.unpack("<I", header[16:20])[0]
+    if length > 4_000_000:
+        raise ValueError("message too large")
+    payload = await reader.readexactly(length)
+    return command, payload
+
+
+# ---------------------------------------------------------------- one node
+async def visit(ip: str, port: int):
+    """Handshake + getaddr. Returns (info, addresses) or None if unreachable."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), CONNECT_TIMEOUT)
+    except Exception:
+        return None
+    try:
+        writer.write(make_msg("version", version_payload(ip, port)))
+        await writer.drain()
+
+        state = {"info": None, "verack": False}
+
+        async def handshake():
+            while not (state["info"] and state["verack"]):
+                cmd, payload = await read_msg(reader)
+                if cmd == "version":
+                    state["info"] = parse_version(payload)
+                    writer.write(make_msg("verack"))
+                    await writer.drain()
+                elif cmd == "verack":
+                    state["verack"] = True
+
+        await asyncio.wait_for(handshake(), HANDSHAKE_TIMEOUT)
+
+        writer.write(make_msg("getaddr"))
+        await writer.drain()
+        addresses = []
+
+        async def collect():
+            while True:
+                cmd, payload = await read_msg(reader)
+                if cmd == "ping":
+                    writer.write(make_msg("pong", payload))
+                    await writer.drain()
+                elif cmd == "addr":
+                    batch = parse_addr(payload)
+                    addresses.extend(batch)
+                    if len(batch) > 1:   # a real getaddr reply, not a self-announce
+                        return
+
+        try:
+            await asyncio.wait_for(collect(), GETADDR_TIMEOUT)
+        except Exception:
+            pass  # node is still reachable even if it sends no addresses
+        return state["info"], addresses
+    except Exception:
+        return None
+    finally:
+        writer.close()
+
+
+# ---------------------------------------------------------------- crawl loop
+async def resolve_seeds():
+    loop = asyncio.get_running_loop()
+    ips = set()
+    for seed in DNS_SEEDS:
+        try:
+            infos = await asyncio.wait_for(
+                loop.getaddrinfo(seed, DEFAULT_PORT, type=socket.SOCK_STREAM), 10)
+            ips.update(info[4][0] for info in infos)
+        except Exception as exc:
+            print(f"  seed {seed}: {exc}")
+    return sorted(ips)
+
+
+def ipv6_available() -> bool:
+    try:
+        with socket.create_connection(("2001:4860:4860::8888", 53), timeout=3):
+            return True
+    except OSError:
+        return False
+
+
+async def crawl():
+    deadline = time.time() + CRAWL_SECONDS
+    use_ipv6 = ipv6_available()
+    print(f"IPv6 connectivity: {'yes' if use_ipv6 else 'no (IPv6 nodes skipped)'}")
+
+    queue: asyncio.Queue = asyncio.Queue()
+    seen = set()
+    reachable = {}
+    active = 0
+
+    def enqueue(ip, port):
+        key = (ip, port)
+        if key in seen:
+            return
+        if ":" in ip and not use_ipv6:
+            return
+        seen.add(key)
+        queue.put_nowait(key)
+
+    seeds = await resolve_seeds()
+    random.shuffle(seeds)
+    print(f"Resolved {len(seeds)} seed addresses")
+    for ip in seeds:
+        enqueue(ip, DEFAULT_PORT)
+
+    async def worker():
+        nonlocal active
+        while time.time() < deadline:
+            try:
+                ip, port = await asyncio.wait_for(queue.get(), 5)
+            except asyncio.TimeoutError:
+                if active == 0 and queue.empty():
+                    return
+                continue
+            active += 1
+            try:
+                result = await visit(ip, port)
+            finally:
+                active -= 1
+            if not result:
+                continue
+            info, addresses = result
+            reachable[(ip, port)] = info
+            now = time.time()
+            for ts, a_ip, a_port in addresses:
+                if now - ts < MAX_ADDR_AGE:
+                    enqueue(a_ip, a_port)
+
+    async def progress():
+        while time.time() < deadline:
+            await asyncio.sleep(60)
+            print(f"  {len(reachable):>6} reachable | {len(seen):>7} tried/queued "
+                  f"| {queue.qsize():>7} waiting")
+
+    reporter = asyncio.create_task(progress())
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(worker() for _ in range(CONCURRENCY))),
+            CRAWL_SECONDS + 60)
+    except asyncio.TimeoutError:
+        pass
+    reporter.cancel()
+    return reachable, len(seen)
+
+
+# ---------------------------------------------------------------- enrichment
+def open_geo():
+    try:
+        import maxminddb
+    except ImportError:
+        print("maxminddb not installed - skipping geolocation")
+        return None, None
+    city = GEO_DIR / "dbip-city-lite.mmdb"
+    asn = GEO_DIR / "dbip-asn-lite.mmdb"
+    return (maxminddb.open_database(str(city)) if city.exists() else None,
+            maxminddb.open_database(str(asn)) if asn.exists() else None)
+
+
+def consensus_height(heights):
+    """Pick the network's block height from what nodes reported at handshake.
+
+    Nodes report their height at the moment we connected, and a crawl lasts
+    ~20 minutes (2 or so new blocks), so values cluster a few blocks apart.
+    Lagging/syncing nodes report much lower numbers and a few broken nodes
+    report absurd ones. Strategy: take the most common height among nodes
+    within 6 blocks of the 99th-percentile height.
+    """
+    valid = sorted(h for h in heights if h > 0)
+    if not valid:
+        return 0
+    top = valid[int(len(valid) * 0.99) - 1 if len(valid) > 1 else 0]
+    near_tip = [h for h in valid if top - 6 <= h <= top]
+    return Counter(near_tip).most_common(1)[0][0]
+
+
+def build_rows(reachable):
+    city_db, asn_db = open_geo()
+    rows = []
+    for (ip, port), info in reachable.items():
+        cc = country = city = org = ""
+        lat = lon = None
+        asn = 0
+        if city_db:
+            rec = city_db.get(ip) or {}
+            cc = (rec.get("country") or {}).get("iso_code", "")
+            country = ((rec.get("country") or {}).get("names") or {}).get("en", "")
+            city = ((rec.get("city") or {}).get("names") or {}).get("en", "")
+            loc = rec.get("location") or {}
+            if "latitude" in loc:
+                lat, lon = round(loc["latitude"], 2), round(loc["longitude"], 2)
+        if asn_db:
+            rec = asn_db.get(ip) or {}
+            asn = rec.get("autonomous_system_number", 0) or 0
+            org = rec.get("autonomous_system_organization", "") or ""
+        rows.append([ip, port, info["ua"], info["protocol"], info["services"],
+                     info["height"], cc, country, city, lat, lon, asn, org])
+    rows.sort(key=lambda r: (r[6], r[0]))
+    return rows
+
+
+# ---------------------------------------------------------------- main
+def main():
+    started = time.time()
+    print(f"Crawling for up to {CRAWL_SECONDS}s with {CONCURRENCY} connections")
+    reachable, attempted = asyncio.run(crawl())
+    rows = build_rows(reachable)
+    height = consensus_height([r[5] for r in rows])
+    now = int(time.time())
+
+    snapshot = {
+        "timestamp": now,
+        "duration": round(now - started),
+        "attempted": attempted,
+        "total": len(rows),
+        "height": height,
+        "columns": ["ip", "port", "user_agent", "protocol", "services", "height",
+                    "country_code", "country", "city", "lat", "lon", "asn", "org"],
+        "nodes": rows,
+    }
+    DATA_DIR.mkdir(exist_ok=True)
+    (DATA_DIR / "latest.json").write_text(json.dumps(snapshot, separators=(",", ":")))
+
+    history_file = DATA_DIR / "history.json"
+    try:
+        history = json.loads(history_file.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        history = []
+    if rows:  # never record an empty crawl (e.g. network failure) as "0 nodes"
+        history.append([now, len(rows), height])
+    history_file.write_text(json.dumps(history[-HISTORY_LIMIT:], separators=(",", ":")))
+
+    print(f"Done: {len(rows)} reachable nodes, height {height}, "
+          f"{attempted} addresses tried, {now - started:.0f}s")
+
+
+if __name__ == "__main__":
+    main()

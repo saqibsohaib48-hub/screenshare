@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NodeScope · Bitcoin Node Map</title>
+<meta name="description" content="Live map and statistics of reachable Bitcoin nodes, updated by an open-source crawler.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #07090c;
+    --panel: #0e1217;
+    --panel-2: #131820;
+    --line: #1e2630;
+    --text: #e6edf3;
+    --muted: #8593a3;
+    --accent: #2ee6c8;      /* node teal */
+    --accent-dim: rgba(46, 230, 200, .14);
+    --warn: #f5b84a;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --sans: "Inter", system-ui, -apple-system, Segoe UI, sans-serif;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); }
+  body { min-height: 100vh; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 0 20px; }
+
+  /* header */
+  header { border-bottom: 1px solid var(--line); background: rgba(7,9,12,.85); backdrop-filter: blur(8px); position: sticky; top: 0; z-index: 2000; }
+  header .wrap { display: flex; align-items: center; justify-content: space-between; gap: 16px; height: 64px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand h1 { margin: 0; font: 600 18px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; }
+  .brand p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+  .live { display: flex; align-items: center; gap: 8px; font: 12px var(--mono); color: var(--muted); white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 0 var(--accent); animation: pulse 2s infinite; }
+  .dot.stale { background: var(--warn); animation: none; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(46,230,200,.6); } 70% { box-shadow: 0 0 0 8px rgba(46,230,200,0); } 100% { box-shadow: 0 0 0 0 rgba(46,230,200,0); } }
+
+  /* KPIs */
+  .kpis { display: grid; grid-template-columns: repeat(6, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; margin: 20px 0; }
+  .kpi { background: var(--panel); padding: 16px 18px; }
+  .kpi .label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  .kpi .value { font: 600 26px/1.2 var(--mono); margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .kpi.hero .value { color: var(--accent); font-size: 32px; }
+  .kpi .sub { font: 11px var(--mono); color: var(--muted); margin-top: 4px; }
+
+  /* layout */
+  .grid { display: grid; grid-template-columns: minmax(0, 2.2fr) minmax(0, 1fr); gap: 20px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; margin-top: 20px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .card h2 { margin: 0; padding: 14px 16px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; }
+  .card h2 small { font: 11px var(--mono); text-transform: none; letter-spacing: 0; }
+
+  #map { height: 520px; background: #0a0d11; }
+  .leaflet-container { font-family: var(--sans); }
+  .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); }
+  .leaflet-popup-content { font: 12px/1.5 var(--mono); margin: 10px 14px; }
+  .leaflet-control-attribution { background: rgba(7,9,12,.7) !important; color: var(--muted) !important; }
+  .leaflet-control-attribution a { color: var(--muted) !important; }
+  .leaflet-bar a { background: var(--panel-2); color: var(--text); border-color: var(--line); }
+
+  /* ranked bar lists */
+  .bars { list-style: none; margin: 0; padding: 8px 0; }
+  .bars li { position: relative; padding: 8px 16px; display: flex; justify-content: space-between; gap: 12px; font: 12px var(--mono); }
+  .bars li .fill { position: absolute; inset: 3px auto 3px 0; background: var(--accent-dim); border-right: 2px solid var(--accent); z-index: 0; }
+  .bars li span { position: relative; z-index: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bars li .n { color: var(--muted); flex-shrink: 0; }
+  .bars li .n b { color: var(--text); font-weight: 600; }
+  #agents.bars li { padding: 10px 16px; }
+
+  /* history chart */
+  #history { padding: 12px 16px 16px; }
+  #history svg { width: 100%; height: 190px; display: block; }
+  .axis { font: 10px var(--mono); fill: var(--muted); }
+
+  /* table */
+  .table-card { margin: 20px 0; }
+  .toolbar { display: flex; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; align-items: center; }
+  .toolbar input { flex: 1; min-width: 200px; background: var(--bg); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 9px 12px; font: 13px var(--mono); outline: none; }
+  .toolbar input:focus { border-color: var(--accent); }
+  button { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; font: 12px var(--mono); cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  .table-scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font: 12px var(--mono); }
+  th, td { padding: 9px 16px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--panel); }
+  th:hover { color: var(--text); }
+  th.sorted { color: var(--accent); }
+  tbody tr:hover { background: var(--panel-2); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; background: var(--panel-2); border: 1px solid var(--line); color: var(--muted); font-size: 10px; margin-right: 4px; }
+  .lag { color: var(--warn); }
+  .pager { display: flex; justify-content: space-between; align-items: center; padding: 10px 16px; color: var(--muted); font: 12px var(--mono); }
+  .pager div { display: flex; gap: 8px; }
+
+  /* empty state */
+  .notice { margin: 40px auto; max-width: 640px; padding: 28px; text-align: center; border: 1px dashed var(--line); border-radius: var(--radius); color: var(--muted); line-height: 1.6; }
+  .notice h2 { color: var(--text); margin-top: 0; font-size: 18px; }
+  .notice code { background: var(--panel-2); padding: 2px 6px; border-radius: 4px; font-family: var(--mono); color: var(--text); }
+
+  footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.7; padding: 24px 0 40px; }
+
+  @media (max-width: 1100px) {
+    .kpis { grid-template-columns: repeat(3, 1fr); }
+    .grid, .grid-3 { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 600px) {
+    .wrap { padding: 0 16px; }
+    .kpis { grid-template-columns: repeat(2, 1fr); }
+    .kpi .value { font-size: 20px; } .kpi.hero .value { font-size: 24px; }
+    #map { height: 340px; }
+    .brand p, .live .txt-long { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="brand">
+      <!-- Original NodeScope mark: a small peer graph -->
+      <svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true">
+        <g stroke="#2ee6c8" stroke-width="1.5" fill="none" opacity=".55">
+          <path d="M8 9 L17 17 L26 8 M17 17 L10 26 M17 17 L27 24 M8 9 L10 26"/>
+        </g>
+        <g fill="#2ee6c8">
+          <circle cx="17" cy="17" r="4"/><circle cx="8" cy="9" r="2.5"/><circle cx="26" cy="8" r="2.5"/>
+          <circle cx="10" cy="26" r="2.5"/><circle cx="27" cy="24" r="2.5"/>
+        </g>
+      </svg>
+      <div>
+        <h1>NodeScope</h1>
+        <p>Live map of reachable nodes in the Bitcoin network</p>
+      </div>
+    </div>
+    <div class="live"><span class="dot" id="live-dot"></span><span id="live-text">Loading…</span></div>
+  </div>
+</header>
+
+<main class="wrap" id="app">
+  <section class="kpis" id="kpis" aria-label="Network summary"></section>
+
+  <section class="grid">
+    <div class="card">
+      <h2>Node map <small id="map-note"></small></h2>
+      <div id="map"></div>
+    </div>
+    <div class="card">
+      <h2>Top user agents <small>software / version</small></h2>
+      <ul class="bars" id="agents"></ul>
+    </div>
+  </section>
+
+  <section class="grid-3">
+    <div class="card"><h2>Top countries</h2><ul class="bars" id="countries"></ul></div>
+    <div class="card"><h2>Top networks <small>ASN</small></h2><ul class="bars" id="networks"></ul></div>
+    <div class="card"><h2>Reachable nodes over time</h2><div id="history"></div></div>
+  </section>
+
+  <section class="card table-card">
+    <h2>All reachable nodes <small id="table-count"></small></h2>
+    <div class="toolbar">
+      <input id="search" type="search" placeholder="Search IP, user agent, country, city, network…" autocomplete="off" spellcheck="false">
+      <button id="csv">Download CSV</button>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr id="thead"></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <span id="page-info"></span>
+      <div><button id="prev">← Prev</button><button id="next">Next →</button></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>NodeScope crawls the Bitcoin peer-to-peer network from DNS seeds, performs a <code>version</code> handshake with every node it can reach, and asks each one for more peers with <code>getaddr</code>. A node counts as <b>reachable</b> if it accepted an inbound connection during the crawl. Tor-only nodes are not counted, so totals are lower than estimates that include them.</p>
+    <p>IP geolocation by <a href="https://db-ip.com" rel="noopener">DB-IP</a> (CC BY 4.0). Map tiles © <a href="https://www.openstreetmap.org/copyright" rel="noopener">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions" rel="noopener">CARTO</a>. Raw data: <a href="data/latest.json">latest.json</a> · <a href="data/history.json">history.json</a></p>
+  </div>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(() => {
+  "use strict";
+
+  const COL = { ip: 0, port: 1, ua: 2, proto: 3, svc: 4, height: 5, cc: 6, country: 7, city: 8, lat: 9, lon: 10, asn: 11, org: 12 };
+  const PAGE_SIZE = 50;
+  const SERVICE_FLAGS = [[1, "NETWORK"], [4, "BLOOM"], [8, "WITNESS"], [64, "CFILTERS"], [1024, "LIMITED"], [2048, "P2P_V2"]];
+
+  const $ = (id) => document.getElementById(id);
+  const fmt = (n) => Number(n).toLocaleString("en-US");
+  const pct = (a, b) => b ? (100 * a / b).toFixed(2) + "%" : "–";
+  // Every string from the network is untrusted (user agents are chosen by node operators).
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+
+  function timeAgo(ts) {
+    const s = Math.max(0, Date.now() / 1000 - ts);
+    if (s < 90) return "just now";
+    if (s < 5400) return Math.round(s / 60) + " min ago";
+    if (s < 172800) return Math.round(s / 3600) + " h ago";
+    return Math.round(s / 86400) + " days ago";
+  }
+
+  function topN(rows, keyFn, n) {
+    const counts = new Map();
+    for (const r of rows) { const k = keyFn(r); if (k) counts.set(k, (counts.get(k) || 0) + 1); }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, n);
+  }
+
+  function renderBars(el, items, total, labelFn = (k) => k) {
+    const max = items.length ? items[0][1] : 1;
+    el.innerHTML = items.map(([k, v]) =>
+      `<li title="${esc(labelFn(k))}"><div class="fill" style="width:${(100 * v / max).toFixed(1)}%"></div>` +
+      `<span>${esc(labelFn(k))}</span><span class="n"><b>${pct(v, total)}</b> · ${fmt(v)}</span></li>`).join("")
+      || `<li><span class="n">No data</span></li>`;
+  }
+
+  // ------------------------------------------------------------ KPIs
+  function renderKpis(snap, rows) {
+    const full = rows.filter((r) => r[COL.svc] & 1).length;
+    const synced = rows.filter((r) => r[COL.height] >= snap.height - 6).length;
+    const v6 = rows.filter((r) => r[COL.ip].includes(":")).length;
+    const countries = new Set(rows.map((r) => r[COL.cc]).filter(Boolean)).size;
+    const kpis = [
+      ["Reachable nodes", fmt(snap.total), `${fmt(snap.attempted)} addresses tried`, true],
+      ["Consensus height", fmt(snap.height), "most common tip", false],
+      ["Countries", countries ? fmt(countries) : "–", "with ≥1 node", false],
+      ["Full nodes", pct(full, rows.length), `${fmt(rows.length - full)} pruned`, false],
+      ["In sync", pct(synced, rows.length), "within 6 blocks of tip", false],
+      ["IPv4 / IPv6", `${fmt(rows.length - v6)} / ${fmt(v6)}`, `crawl took ${Math.round(snap.duration / 60)} min`, false],
+    ];
+    $("kpis").innerHTML = kpis.map(([label, value, sub, hero]) =>
+      `<div class="kpi${hero ? " hero" : ""}"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`).join("");
+  }
+
+  // ------------------------------------------------------------ map
+  function renderMap(rows) {
+    if (!window.L) { $("map").innerHTML = `<p class="axis" style="padding:40px;text-align:center">Map library could not load. Check your connection or ad blocker.</p>`; return; }
+    const map = L.map("map", { worldCopyJump: true, preferCanvas: true, zoomControl: true, minZoom: 2 }).setView([30, 10], 2);
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+      subdomains: "abcd", maxZoom: 12,
+    }).addTo(map);
+
+    // Group nodes that share a location so thousands of points stay fast and readable.
+    const places = new Map();
+    let located = 0;
+    for (const r of rows) {
+      if (r[COL.lat] == null) continue;
+      located++;
+      const key = r[COL.lat].toFixed(1) + "," + r[COL.lon].toFixed(1);
+      const p = places.get(key) || { lat: r[COL.lat], lon: r[COL.lon], n: 0, city: r[COL.city], country: r[COL.country], sample: [] };
+      p.n++;
+      if (p.sample.length < 5) p.sample.push(r);
+      places.set(key, p);
+    }
+    for (const p of places.values()) {
+      const radius = Math.min(18, 3 + Math.sqrt(p.n) * 1.6);
+      const label = [p.city, p.country].filter(Boolean).join(", ") || "Unknown location";
+      const list = p.sample.map((r) => `${esc(fmtAddr(r))}<br><span style="color:#8593a3">${esc(r[COL.ua])}</span>`).join("<br>");
+      L.circleMarker([p.lat, p.lon], { radius, color: "#2ee6c8", weight: 1, fillColor: "#2ee6c8", fillOpacity: .45 })
+        .bindPopup(`<b>${esc(label)}</b><br>${fmt(p.n)} node${p.n > 1 ? "s" : ""}<br><br>${list}${p.n > 5 ? "<br>…" : ""}`)
+        .addTo(map);
+    }
+    $("map-note").textContent = located ? `${fmt(located)} geolocated` : "no geolocation data";
+  }
+
+  // ------------------------------------------------------------ history chart (plain SVG)
+  function renderHistory(history) {
+    const el = $("history");
+    const pts = (history || []).filter((h) => h[1] > 0);
+    if (pts.length < 2) { el.innerHTML = `<p class="axis" style="padding:40px 0;text-align:center">Chart appears after two or more crawls.</p>`; return; }
+    const W = 400, H = 190, P = { l: 44, r: 8, t: 10, b: 22 };
+    const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs);
+    let y0 = Math.min(...ys), y1 = Math.max(...ys);
+    const pad = Math.max(10, (y1 - y0) * 0.15); y0 -= pad; y1 += pad;
+    const X = (t) => P.l + (t - x0) / (x1 - x0 || 1) * (W - P.l - P.r);
+    const Y = (v) => P.t + (1 - (v - y0) / (y1 - y0)) * (H - P.t - P.b);
+    const line = pts.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join("");
+    const area = `${line}L${X(x1)},${H - P.b}L${X(x0)},${H - P.b}Z`;
+    const date = (t) => new Date(t * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    const ticks = [y0 + pad, (y0 + y1) / 2, y1 - pad];
+    el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Reachable nodes over time">
+      <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2ee6c8" stop-opacity=".35"/><stop offset="1" stop-color="#2ee6c8" stop-opacity="0"/></linearGradient></defs>
+      ${ticks.map((v) => `<line x1="${P.l}" x2="${W - P.r}" y1="${Y(v)}" y2="${Y(v)}" stroke="#1e2630"/><text class="axis" x="${P.l - 6}" y="${Y(v) + 3}" text-anchor="end">${fmt(Math.round(v))}</text>`).join("")}
+      <path d="${area}" fill="url(#g)"/><path d="${line}" fill="none" stroke="#2ee6c8" stroke-width="1.6" vector-effect="non-scaling-stroke"/>
+      <text class="axis" x="${P.l}" y="${H - 6}">${date(x0)}</text><text class="axis" x="${W - P.r}" y="${H - 6}" text-anchor="end">${date(x1)}</text>
+    </svg>`;
+  }
+
+  // ------------------------------------------------------------ table
+  const fmtAddr = (r) => r[COL.ip].includes(":") ? `[${r[COL.ip]}]:${r[COL.port]}` : `${r[COL.ip]}:${r[COL.port]}`;
+  const services = (v) => SERVICE_FLAGS.filter(([bit]) => v & bit).map(([, name]) => `<span class="tag">${name}</span>`).join("");
+  const COLUMNS = [
+    { key: "Address", get: (r) => fmtAddr(r), sort: (r) => r[COL.ip] },
+    { key: "User agent", get: (r) => esc(r[COL.ua]), sort: (r) => r[COL.ua] },
+    { key: "Height", get: (r, s) => `<span class="${r[COL.height] < s.height - 6 ? "lag" : ""}">${fmt(r[COL.height])}</span>`, sort: (r) => r[COL.height], num: true },
+    { key: "Location", get: (r) => esc([r[COL.city], r[COL.cc]].filter(Boolean).join(", ") || "–"), sort: (r) => r[COL.country] + r[COL.city] },
+    { key: "Network", get: (r) => r[COL.asn] ? `AS${r[COL.asn]} <span style="color:#8593a3">${esc(r[COL.org])}</span>` : "–", sort: (r) => r[COL.org] },
+    { key: "Services", get: (r) => services(r[COL.svc]), sort: (r) => r[COL.svc] },
+  ];
+
+  function setupTable(snap, rows) {
+    const state = { query: "", sortCol: 2, dir: -1, page: 0, view: rows };
+    const hay = rows.map((r) => [r[COL.ip], r[COL.port], r[COL.ua], r[COL.country], r[COL.cc], r[COL.city], r[COL.org], "as" + r[COL.asn]].join(" ").toLowerCase());
+
+    function apply() {
+      const q = state.query.trim().toLowerCase();
+      const idx = [];
+      rows.forEach((_, i) => { if (!q || hay[i].includes(q)) idx.push(i); });
+      const sortFn = COLUMNS[state.sortCol].sort;
+      idx.sort((a, b) => { const x = sortFn(rows[a]), y = sortFn(rows[b]); return (x > y ? 1 : x < y ? -1 : 0) * state.dir; });
+      state.view = idx.map((i) => rows[i]);
+      state.page = 0;
+      draw();
+    }
+    function draw() {
+      $("thead").innerHTML = COLUMNS.map((c, i) =>
+        `<th data-i="${i}" class="${i === state.sortCol ? "sorted" : ""}"${c.num ? ' style="text-align:right"' : ""}>${c.key}${i === state.sortCol ? (state.dir > 0 ? " ↑" : " ↓") : ""}</th>`).join("");
+      const start = state.page * PAGE_SIZE;
+      const pageRows = state.view.slice(start, start + PAGE_SIZE);
+      $("tbody").innerHTML = pageRows.map((r) => "<tr>" + COLUMNS.map((c) => `<td class="${c.num ? "num" : ""}">${c.get(r, snap)}</td>`).join("") + "</tr>").join("")
+        || `<tr><td colspan="${COLUMNS.length}" style="color:#8593a3">No nodes match “${esc(state.query)}”.</td></tr>`;
+      const pages = Math.max(1, Math.ceil(state.view.length / PAGE_SIZE));
+      $("page-info").textContent = `Page ${state.page + 1} of ${fmt(pages)}`;
+      $("table-count").textContent = `${fmt(state.view.length)} shown`;
+      $("prev").disabled = state.page === 0;
+      $("next").disabled = state.page >= pages - 1;
+    }
+
+    $("thead").addEventListener("click", (e) => {
+      const th = e.target.closest("th"); if (!th) return;
+      const i = +th.dataset.i;
+      state.dir = i === state.sortCol ? -state.dir : (COLUMNS[i].num ? -1 : 1);
+      state.sortCol = i; apply();
+    });
+    let t; $("search").addEventListener("input", (e) => { clearTimeout(t); t = setTimeout(() => { state.query = e.target.value; apply(); }, 150); });
+    $("prev").onclick = () => { state.page--; draw(); };
+    $("next").onclick = () => { state.page++; draw(); };
+    $("csv").onclick = () => {
+      const q = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+      const lines = [snap.columns.join(",")].concat(state.view.map((r) => r.map(q).join(",")));
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
+      a.download = `bitcoin-nodes-${snap.timestamp}.csv`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    };
+    apply();
+  }
+
+  // ------------------------------------------------------------ boot
+  function showEmpty(reason) {
+    $("app").innerHTML = `<div class="notice"><h2>No snapshot yet</h2>
+      <p>${esc(reason)}</p>
+      <p>Open your repository's <b>Actions</b> tab, choose <code>Crawl Bitcoin nodes</code> and click <b>Run workflow</b>. The first crawl takes about 25 minutes, then this page fills in automatically.</p></div>`;
+    $("live-text").textContent = "waiting for first crawl";
+    $("live-dot").classList.add("stale");
+  }
+
+  async function load() {
+    let snap, history = [];
+    try {
+      const res = await fetch("data/latest.json", { cache: "no-cache" });
+      if (!res.ok) throw new Error(`data/latest.json returned ${res.status}`);
+      snap = await res.json();
+    } catch (err) {
+      return showEmpty("The crawler hasn't published data/latest.json yet.");
+    }
+    try { const h = await fetch("data/history.json", { cache: "no-cache" }); if (h.ok) history = await h.json(); } catch (_) {}
+
+    const rows = snap.nodes || [];
+    const ageH = (Date.now() / 1000 - snap.timestamp) / 3600;
+    $("live-text").innerHTML = `<span class="txt-long">Snapshot </span>${esc(timeAgo(snap.timestamp))}`;
+    $("live-text").title = new Date(snap.timestamp * 1000).toUTCString();
+    if (ageH > 6) $("live-dot").classList.add("stale");
+
+    renderKpis(snap, rows);
+    renderBars($("agents"), topN(rows, (r) => r[COL.ua], 12), rows.length);
+    renderBars($("countries"), topN(rows, (r) => r[COL.country], 10), rows.length);
+    renderBars($("networks"), topN(rows, (r) => r[COL.asn] ? `AS${r[COL.asn]} ${r[COL.org]}` : "", 10), rows.length);
+    renderHistory(history);
+    setupTable(snap, rows);
+    renderMap(rows);
+  }
+
+  load();
+})();
+</script>
+</body>
+</html>
