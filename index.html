@@ -20,6 +20,7 @@
     --accent: #2ee6c8;      /* node teal */
     --accent-dim: rgba(46, 230, 200, .14);
     --warn: #f5b84a;
+    --bad: #ff6b6b;
     --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
     --sans: "Inter", system-ui, -apple-system, Segoe UI, sans-serif;
     --radius: 10px;
@@ -107,7 +108,31 @@
 
   footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.7; padding: 24px 0 40px; }
 
+  /* market mood */
+  .mood { margin-bottom: 20px; }
+  .mood-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 4px 0 12px; }
+  .mood-head h2 { margin: 0; font: 600 13px var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+  .mood-head span { color: var(--muted); font-size: 12px; }
+  .mood-cards { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+  .mcard { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+  .mcard .label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  .mcard .value { font: 600 22px/1.25 var(--mono); margin: 6px 0 8px; font-variant-numeric: tabular-nums; }
+  .mcard .sub { font: 11px/1.5 var(--mono); color: var(--muted); margin-top: 8px; }
+  .pill { display: inline-block; font: 600 11px var(--mono); padding: 3px 8px; border-radius: 999px; border: 1px solid currentColor; }
+  .good { color: var(--accent); } .bad { color: var(--bad); } .warn { color: var(--warn); } .mid { color: var(--muted); }
+  .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin-top: 12px; }
+  .verdict { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  .verdict b { display: block; font-size: 16px; margin: 6px 0 4px; }
+  .verdict p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+  .guide td, .guide th { white-space: normal; vertical-align: top; line-height: 1.5; }
+  .guide th { cursor: default; position: static; }
+  tr.current td { background: var(--accent-dim); }
+  tr.current td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+  .note { padding: 10px 16px; color: var(--muted); font-size: 11px; font-family: var(--mono); }
+
   @media (max-width: 1100px) {
+    .mood-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-2 { grid-template-columns: 1fr; }
     .kpis { grid-template-columns: repeat(3, 1fr); }
     .grid, .grid-3 { grid-template-columns: 1fr; }
   }
@@ -145,6 +170,21 @@
 
 <main class="wrap" id="app">
   <section class="kpis" id="kpis" aria-label="Network summary"></section>
+
+  <section class="mood" aria-label="Market mood">
+    <div class="mood-head"><h2>Market mood</h2><span>Price sets the direction. The network sets your confidence.</span></div>
+    <div class="mood-cards" id="mood-cards"></div>
+    <div class="grid-2">
+      <div class="card">
+        <h2>Combine with price <small>price vs 200-day avg × network</small></h2>
+        <div id="mood-matrix"></div>
+      </div>
+      <div class="card">
+        <h2>What to look at <small>your live numbers</small></h2>
+        <div id="mood-guide"></div>
+      </div>
+    </div>
+  </section>
 
   <section class="grid">
     <div class="card">
@@ -226,18 +266,182 @@
       || `<li><span class="n">No data</span></li>`;
   }
 
+  // ------------------------------------------------------------ market mood settings
+  // Change these to tune how sensitive the Market mood cards are.
+  const MOOD = {
+    grow7: 3,             // 7-day node change (%) that counts as growing / shrinking
+    grow30: 5,            // 30-day node change (%) that counts as growing / shrinking
+    newcomersBelow: 88,   // in-sync % below this = many new nodes still downloading
+    knotsRisePts: 2,      // Knots share change (percentage points) that counts as "rising fast"
+    countryDropPct: 25,   // a country losing this % of nodes in ~24 h triggers an alert
+    countryMinNodes: 50,  // ...but only for countries with at least this many nodes
+  };
+  const DAY = 86400;
+
+  // Block height most nodes agree on (a small group of fake nodes can't hijack it).
+  function consensusHeight(rows) {
+    const c = new Map();
+    for (const r of rows) { const h = r[COL.height]; if (h > 0) c.set(h, (c.get(h) || 0) + 1); }
+    let best = 0, bestSupport = -1;
+    for (const h of c.keys()) {
+      const s = c.get(h) + (c.get(h - 1) || 0) + (c.get(h - 2) || 0);
+      if (s > bestSupport || (s === bestSupport && h > best)) { best = h; bestSupport = s; }
+    }
+    return best;
+  }
+  const isSynced = (h, ref) => h >= ref - 6 && h <= ref + 2;
+
+  // history.json holds old [t, nodes, height] rows and newer {t, n, h, s, k, cc} objects.
+  const normHistory = (raw) => (raw || []).map((p) => Array.isArray(p) ? { t: p[0], n: p[1], h: p[2] } : p).filter((p) => p && p.n > 0);
+  const mean = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+  const near = (hist, t, tol) => hist.filter((p) => Math.abs(p.t - t) <= tol);
+  const daysCollected = (hist) => hist.length ? (hist[hist.length - 1].t - hist[0].t) / DAY : 0;
+
+  // Node change over `days`, smoothing each end over 12 h so one odd crawl doesn't flip the label.
+  function nodeChange(hist, days, threshold) {
+    const have = daysCollected(hist);
+    if (have < days - 0.5) return { state: "pending", have, need: days };
+    const last = hist[hist.length - 1].t;
+    const now = hist.filter((p) => p.t >= last - DAY / 2).map((p) => p.n);
+    const then = near(hist, last - days * DAY, DAY / 2).map((p) => p.n);
+    if (!then.length) return { state: "pending", have, need: days };
+    const a = mean(then), b = mean(now), pct = (b - a) / a * 100;
+    return { state: pct >= threshold ? "grow" : pct <= -threshold ? "shrink" : "stable", pct, from: a, to: b };
+  }
+
+  function knotsTrend(hist, current) {
+    const pts = hist.filter((p) => p.k != null);
+    if (pts.length < 2 || (pts[pts.length - 1].t - pts[0].t) < 7 * DAY) return { state: "pending", current };
+    const last = pts[pts.length - 1].t;
+    const ref30 = near(pts, last - 30 * DAY, DAY / 2);
+    const ref = ref30.length ? ref30[0] : pts[0];
+    const before = 100 * ref.k / ref.n, diff = current - before;
+    const days = Math.round((last - ref.t) / DAY);
+    return { state: diff >= MOOD.knotsRisePts ? "rising" : diff <= -MOOD.knotsRisePts ? "falling" : "stable", current, before, diff, days };
+  }
+
+  function countryDrops(hist, rows) {
+    const nowT = hist.length ? hist[hist.length - 1].t : 0;
+    const prev = hist.filter((p) => p.cc && nowT - p.t >= 18 * 3600 && nowT - p.t <= 36 * 3600);
+    if (!prev.length) return { state: "pending" };
+    const before = prev[prev.length - 1].cc;
+    const nowCounts = {}, names = {};
+    for (const r of rows) if (r[COL.cc]) { nowCounts[r[COL.cc]] = (nowCounts[r[COL.cc]] || 0) + 1; names[r[COL.cc]] = r[COL.country]; }
+    const drops = Object.entries(before)
+      .filter(([, n]) => n >= MOOD.countryMinNodes)
+      .map(([cc, n]) => ({ cc, name: names[cc] || cc, from: n, to: nowCounts[cc] || 0, pct: ((nowCounts[cc] || 0) - n) / n * 100 }))
+      .filter((d) => d.pct <= -MOOD.countryDropPct)
+      .sort((a, b) => a.pct - b.pct);
+    return { state: drops.length ? "alert" : "ok", drops };
+  }
+
+  // Daily BTC closes from public APIs (no key needed). Tries several in case one is blocked.
+  async function fetchDailyCloses() {
+    const tries = [
+      async () => (await (await fetch("https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400")).json())
+        .sort((a, b) => a[0] - b[0]).map((c) => +c[4]),
+      async () => (await (await fetch("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=250")).json()).map((k) => +k[4]),
+      async () => (await (await fetch("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=220&interval=daily")).json()).prices.map((p) => +p[1]),
+    ];
+    for (const t of tries) { try { const c = await t(); if (c.length >= 200 && c.every(Number.isFinite)) return c; } catch (_) {} }
+    return null;
+  }
+
+  // ------------------------------------------------------------ market mood render
+  const pill = (cls, text) => `<span class="pill ${cls}">${esc(text)}</span>`;
+  const signed = (v, d = 1) => (v > 0 ? "+" : "") + v.toFixed(d);
+  const usd = (v) => "$" + Math.round(v).toLocaleString("en-US");
+  const STATE = { grow: ["good", "Growing"], shrink: ["bad", "Shrinking"], stable: ["mid", "Stable"], pending: ["mid", "Collecting data"] };
+
+  function changeCard(label, ch, days, threshold) {
+    const [cls, word] = STATE[ch.state];
+    const value = ch.state === "pending" ? `${Math.min(ch.have, days).toFixed(1)} / ${days} d` : signed(ch.pct) + "%";
+    const sub = ch.state === "pending"
+      ? `Needs ${days} days of history. Fills in automatically.`
+      : `${fmt(Math.round(ch.from))} → ${fmt(Math.round(ch.to))} nodes · ±${threshold}% = noise`;
+    return `<div class="mcard"><div class="label">${label}</div><div class="value ${cls}">${value}</div>${pill(cls, word)}<div class="sub">${sub}</div></div>`;
+  }
+
+  function renderMood(snap, rows, hist, price) {
+    const ch7 = nodeChange(hist, 7, MOOD.grow7);
+    const ch30 = nodeChange(hist, 30, MOOD.grow30);
+    const syncPct = 100 * snap.inSync / (rows.length || 1);
+    const newcomers = syncPct < MOOD.newcomersBelow;
+    const knotsNow = 100 * rows.filter((r) => /knots/i.test(r[COL.ua])).length / (rows.length || 1);
+    const kt = knotsTrend(hist, knotsNow);
+    const cd = countryDrops(hist, rows);
+
+    // Price trend card
+    let priceCard, trend = null;
+    if (price) {
+      const p = price[price.length - 1];
+      const sma200 = mean(price.slice(-200)), sma50 = mean(price.slice(-50));
+      const dist = (p - sma200) / sma200 * 100;
+      trend = p >= sma200 ? "up" : "down";
+      priceCard = `<div class="mcard"><div class="label">BTC price trend</div><div class="value">${usd(p)}</div>
+        ${pill(trend === "up" ? "good" : "bad", trend === "up" ? "Uptrend" : "Downtrend")}
+        <div class="sub">${signed(dist)}% vs 200-day avg ${usd(sma200)}<br>50-day avg ${usd(sma50)} (${p >= sma50 ? "above" : "below"})</div></div>`;
+    } else {
+      const loading = price === undefined;
+      priceCard = `<div class="mcard"><div class="label">BTC price trend</div><div class="value mid">–</div>${pill("mid", loading ? "Loading price" : "Price unavailable")}
+        <div class="sub">${loading ? "Fetching 200 days of prices…" : "Price APIs could not be reached from your browser."}</div></div>`;
+    }
+    const syncCard = `<div class="mcard"><div class="label">In sync</div><div class="value ${newcomers ? "good" : ""}">${syncPct.toFixed(1)}%</div>
+      ${pill(newcomers ? "good" : "mid", newcomers ? "Newcomers syncing" : "Normal")}
+      <div class="sub">Below ${MOOD.newcomersBelow}% = many new nodes still downloading the chain.</div></div>`;
+    const kCls = kt.state === "rising" ? "warn" : "mid";
+    const kWord = { rising: "Rising fast", falling: "Falling", stable: "Stable", pending: "Collecting data" }[kt.state];
+    const knotsCard = `<div class="mcard"><div class="label">Knots share</div><div class="value ${kCls}">${knotsNow.toFixed(2)}%</div>
+      ${pill(kCls, kWord)}<div class="sub">${kt.state === "pending" ? "Trend needs 7+ days of history." : `${kt.before.toFixed(2)}% ${kt.days} d ago (${signed(kt.diff, 2)} pts)`}</div></div>`;
+    $("mood-cards").innerHTML = priceCard + changeCard("Nodes, 7 days", ch7, 7, MOOD.grow7) + changeCard("Nodes, 30 days", ch30, 30, MOOD.grow30) + syncCard + knotsCard;
+
+    // Combine matrix: 30-day network if available, else 7-day
+    const net = ch30.state !== "pending" ? { ...ch30, span: "30-day" } : ch7.state !== "pending" ? { ...ch7, span: "7-day" } : { state: "pending" };
+    const MATRIX = [
+      ["up", "grow", "Healthy bull", "good", "Buy dips with a stop-loss."],
+      ["up", "shrink", "Rally without new users", "warn", "Be careful: smaller size, tighter stops."],
+      ["down", "grow", "Quiet accumulation", "warn", "Watch for price to turn up before buying."],
+      ["down", "shrink", "Fear and capitulation", "bad", "Stay small or stay out."],
+    ];
+    const match = MATRIX.find((m) => m[0] === trend && m[1] === net.state);
+    let title, text;
+    if (!trend) { title = price === undefined ? "Loading price…" : "Price unavailable"; text = "The network side still updates; the direction needs the price."; }
+    else if (match) { title = match[2]; text = `${trend === "up" ? "Uptrend" : "Downtrend"} + ${net.span} network ${STATE[net.state][1].toLowerCase()}. ${match[4]}`; }
+    else if (net.state === "stable") { title = trend === "up" ? "Uptrend, network steady" : "Downtrend, network steady"; text = `The network adds no extra signal. ${trend === "up" ? "Follow the uptrend with normal risk." : "Respect the downtrend."}`; }
+    else { title = trend === "up" ? "Uptrend, network unknown yet" : "Downtrend, network unknown yet"; text = `Follow the price trend. Network confidence appears after 7 days of history (${daysCollected(hist).toFixed(1)} collected).`; }
+    const cls = match ? match[3] : "mid";
+    $("mood-matrix").innerHTML = `<div class="verdict">${pill(cls, "Today")}<b class="${cls}">${esc(title)}</b><p>${esc(text)}</p></div>
+      <div class="table-scroll"><table class="guide"><thead><tr><th>Price vs 200-day</th><th>Network</th><th>Market mood</th></tr></thead><tbody>
+      ${MATRIX.map((m) => `<tr class="${m === match ? "current" : ""}"><td>${m[0] === "up" ? "Above" : "Below"}</td><td>${m[1] === "grow" ? "Growing" : "Shrinking"}</td><td class="${m[3]}">${m[2]}<br><span class="mid">${m[4]}</span></td></tr>`).join("")}
+      </tbody></table></div><p class="note">Educational framework, not a trade signal. Nodes change over weeks, not hours.</p>`;
+
+    // Signal guide with live numbers
+    const nodesNow = ch30.state !== "pending" ? `${signed(ch30.pct)}% in 30 d` : ch7.state !== "pending" ? `${signed(ch7.pct)}% in 7 d` : `${fmt(rows.length)} now · ${daysCollected(hist).toFixed(1)} d of history`;
+    const nodesState = net.state === "pending" ? ["mid", "Collecting"] : STATE[net.state];
+    const countryNow = cd.state === "pending" ? "Needs 24 h of history" : cd.drops.length
+      ? cd.drops.slice(0, 3).map((d) => `${esc(d.name)} ${fmt(d.from)} → ${fmt(d.to)} (${Math.round(d.pct)}%)`).join("<br>") : "No sudden drops";
+    const guide = [
+      ["Node count vs last week / month", `More than +${MOOD.grow7}% (7 d) or +${MOOD.grow30}% (30 d): growing interest. Less than −: fading. In between: ignore.`, esc(nodesNow), nodesState],
+      ["In sync %", `Below ~${MOOD.newcomersBelow}%: many new nodes downloading, meaning newcomers arriving.`, `${syncPct.toFixed(1)}%`, newcomers ? ["good", "Newcomers"] : ["mid", "Normal"]],
+      ["Knots share", "Rising fast: community conflict, uncertainty and headlines.", kt.state === "pending" ? `${knotsNow.toFixed(2)}% now` : `${kt.before.toFixed(2)}% → ${knotsNow.toFixed(2)}%`, [kCls, kWord]],
+      ["Top countries", "Sudden big drop in one country: check news for bans or outages.", countryNow, cd.state === "alert" ? ["bad", "Investigate"] : cd.state === "ok" ? ["good", "OK"] : ["mid", "Collecting"]],
+    ];
+    $("mood-guide").innerHTML = `<div class="table-scroll"><table class="guide"><thead><tr><th>What to look at</th><th>Signal</th><th>Your numbers</th><th></th></tr></thead><tbody>
+      ${guide.map(([a, b, c, [k, w]]) => `<tr><td>${a}</td><td class="mid">${b}</td><td>${c}</td><td>${pill(k, w)}</td></tr>`).join("")}
+      </tbody></table></div>`;
+  }
+
   // ------------------------------------------------------------ KPIs
   function renderKpis(snap, rows) {
     const full = rows.filter((r) => r[COL.svc] & 1).length;
-    const synced = rows.filter((r) => r[COL.height] >= snap.height - 6).length;
     const v6 = rows.filter((r) => r[COL.ip].includes(":")).length;
     const countries = new Set(rows.map((r) => r[COL.cc]).filter(Boolean)).size;
     const kpis = [
       ["Reachable nodes", fmt(snap.total), `${fmt(snap.attempted)} addresses tried`, true],
-      ["Consensus height", fmt(snap.height), "most common tip", false],
+      ["Block height", fmt(snap.ref), snap.tip ? "chain tip, cross-checked" : "majority of nodes", false],
       ["Countries", countries ? fmt(countries) : "–", "with ≥1 node", false],
       ["Full nodes", pct(full, rows.length), `${fmt(rows.length - full)} pruned`, false],
-      ["In sync", pct(synced, rows.length), "within 6 blocks of tip", false],
+      ["In sync", pct(snap.inSync, rows.length), "within 6 blocks of tip", false],
       ["IPv4 / IPv6", `${fmt(rows.length - v6)} / ${fmt(v6)}`, `crawl took ${Math.round(snap.duration / 60)} min`, false],
     ];
     $("kpis").innerHTML = kpis.map(([label, value, sub, hero]) =>
@@ -279,7 +483,7 @@
   // ------------------------------------------------------------ history chart (plain SVG)
   function renderHistory(history) {
     const el = $("history");
-    const pts = (history || []).filter((h) => h[1] > 0);
+    const pts = (history || []).map((p) => [p.t, p.n]);
     if (pts.length < 2) { el.innerHTML = `<p class="axis" style="padding:40px 0;text-align:center">Chart appears after two or more crawls.</p>`; return; }
     const W = 400, H = 190, P = { l: 44, r: 8, t: 10, b: 22 };
     const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
@@ -306,7 +510,7 @@
   const COLUMNS = [
     { key: "Address", get: (r) => fmtAddr(r), sort: (r) => r[COL.ip] },
     { key: "User agent", get: (r) => esc(r[COL.ua]), sort: (r) => r[COL.ua] },
-    { key: "Height", get: (r, s) => `<span class="${r[COL.height] < s.height - 6 ? "lag" : ""}">${fmt(r[COL.height])}</span>`, sort: (r) => r[COL.height], num: true },
+    { key: "Height", get: (r, s) => `<span class="${isSynced(r[COL.height], s.ref) ? "" : "lag"}">${fmt(r[COL.height])}</span>`, sort: (r) => r[COL.height], num: true },
     { key: "Location", get: (r) => esc([r[COL.city], r[COL.cc]].filter(Boolean).join(", ") || "–"), sort: (r) => r[COL.country] + r[COL.city] },
     { key: "Network", get: (r) => r[COL.asn] ? `AS${r[COL.asn]} <span style="color:#8593a3">${esc(r[COL.org])}</span>` : "–", sort: (r) => r[COL.org] },
     { key: "Services", get: (r) => services(r[COL.svc]), sort: (r) => r[COL.svc] },
@@ -382,6 +586,11 @@
     try { const h = await fetch("data/history.json", { cache: "no-cache" }); if (h.ok) history = await h.json(); } catch (_) {}
 
     const rows = snap.nodes || [];
+    const hist = normHistory(history);
+    // Height to compare nodes against: cross-checked tip from the new crawler, otherwise
+    // recompute it here (older snapshots could pick a fake height).
+    snap.ref = snap.tip ? snap.height : consensusHeight(rows);
+    snap.inSync = rows.filter((r) => isSynced(r[COL.height], snap.ref)).length;
     const ageH = (Date.now() / 1000 - snap.timestamp) / 3600;
     $("live-text").innerHTML = `<span class="txt-long">Snapshot </span>${esc(timeAgo(snap.timestamp))}`;
     $("live-text").title = new Date(snap.timestamp * 1000).toUTCString();
@@ -391,9 +600,11 @@
     renderBars($("agents"), topN(rows, (r) => r[COL.ua], 12), rows.length);
     renderBars($("countries"), topN(rows, (r) => r[COL.country], 10), rows.length);
     renderBars($("networks"), topN(rows, (r) => r[COL.asn] ? `AS${r[COL.asn]} ${r[COL.org]}` : "", 10), rows.length);
-    renderHistory(history);
+    renderHistory(hist);
     setupTable(snap, rows);
     renderMap(rows);
+    renderMood(snap, rows, hist, undefined);         // network side right away
+    fetchDailyCloses().then((closes) => renderMood(snap, rows, hist, closes));
   }
 
   load();
