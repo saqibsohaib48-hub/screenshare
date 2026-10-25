@@ -130,9 +130,41 @@
   tr.current td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
   .note { padding: 10px 16px; color: var(--muted); font-size: 11px; font-family: var(--mono); }
 
+  /* plain-words summary */
+  .simple { margin-bottom: 12px; padding: 18px 20px; display: grid; grid-template-columns: minmax(220px, 1fr) minmax(0, 2.4fr); gap: 24px; }
+  .simple .lean-label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  .simple .lean { font: 700 28px/1.2 var(--sans); margin: 6px 0 8px; }
+  .simple .lean-sub { color: var(--muted); font-size: 13px; line-height: 1.55; }
+  .scale { display: flex; gap: 3px; margin: 12px 0 6px; }
+  .scale i { flex: 1; height: 6px; border-radius: 3px; background: var(--line); }
+  .scale i.on.bad { background: var(--bad); } .scale i.on.good { background: var(--accent); } .scale i.on.mid { background: var(--muted); }
+  .scale-labels { display: flex; justify-content: space-between; font: 10px var(--mono); color: var(--muted); }
+  .simple ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 9px; }
+  .simple li { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 6px; font-size: 14px; line-height: 1.45; }
+  .simple li .ar { font: 700 15px var(--mono); text-align: center; }
+  .simple li small { display: block; color: var(--muted); font-size: 12px; }
+
+  /* charts */
+  .charts { margin-bottom: 20px; }
+  .range { display: flex; gap: 6px; }
+  .range button.on { border-color: var(--accent); color: var(--accent); }
+  .chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .chart { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px 10px; position: relative; }
+  .chart.wide { grid-column: 1 / -1; }
+  .chart-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .chart-top b { font-size: 13px; font-weight: 600; }
+  .chart-top span { font: 600 15px var(--mono); }
+  .chart p.cap { margin: 4px 0 6px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+  .chart svg { width: 100%; height: 150px; display: block; overflow: visible; }
+  .chart.wide svg { height: 200px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font: 11px var(--mono); color: var(--muted); margin-top: 4px; }
+  .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+  .tip { position: absolute; pointer-events: none; background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font: 11px/1.5 var(--mono); white-space: nowrap; z-index: 5; display: none; }
+  .empty-chart { height: 150px; display: flex; align-items: center; justify-content: center; text-align: center; color: var(--muted); font: 12px var(--mono); border: 1px dashed var(--line); border-radius: 6px; padding: 0 16px; }
+
   @media (max-width: 1100px) {
     .mood-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .grid-2 { grid-template-columns: 1fr; }
+    .grid-2, .chart-grid, .simple { grid-template-columns: 1fr; }
     .kpis { grid-template-columns: repeat(3, 1fr); }
     .grid, .grid-3 { grid-template-columns: 1fr; }
   }
@@ -173,6 +205,7 @@
 
   <section class="mood" aria-label="Market mood">
     <div class="mood-head"><h2>Market mood</h2><span>Price sets the direction. The network sets your confidence.</span></div>
+    <div class="card simple" id="simple" aria-live="polite"></div>
     <div class="mood-cards" id="mood-cards"></div>
     <div class="grid-2">
       <div class="card">
@@ -186,6 +219,16 @@
     </div>
   </section>
 
+  <section class="charts" aria-label="Charts">
+    <div class="mood-head">
+      <h2>Charts</h2>
+      <div class="range" id="range" role="group" aria-label="Time range">
+        <button data-days="1">24h</button><button data-days="7">7d</button><button data-days="30" class="on">30d</button><button data-days="0">All</button>
+      </div>
+    </div>
+    <div class="chart-grid" id="charts"></div>
+  </section>
+
   <section class="grid">
     <div class="card">
       <h2>Node map <small id="map-note"></small></h2>
@@ -197,10 +240,9 @@
     </div>
   </section>
 
-  <section class="grid-3">
+  <section class="grid-2" style="margin-top:20px">
     <div class="card"><h2>Top countries</h2><ul class="bars" id="countries"></ul></div>
     <div class="card"><h2>Top networks <small>ASN</small></h2><ul class="bars" id="networks"></ul></div>
-    <div class="card"><h2>Reachable nodes over time</h2><div id="history"></div></div>
   </section>
 
   <section class="card table-card">
