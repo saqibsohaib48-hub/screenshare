@@ -1,0 +1,78 @@
+name: Crawl Bitcoin nodes
+
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["index.html", "crawler/**", ".github/workflows/**"]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: crawl
+  cancel-in-progress: false
+
+jobs:
+  crawl-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install geolocation reader
+        run: pip install maxminddb
+
+      - name: Download DB-IP Lite geolocation databases
+        continue-on-error: true
+        run: |
+          mkdir -p geo
+          fetch() {
+            for M in $(date -u +%Y-%m) $(date -u -d "$(date -u +%Y-%m-15) -1 month" +%Y-%m); do
+              if curl -fsSL "https://download.db-ip.com/free/$1-$M.mmdb.gz" -o "geo/$1.mmdb.gz"; then
+                gunzip -f "geo/$1.mmdb.gz"; echo "Got $1 ($M)"; return 0
+              fi
+            done
+            echo "::warning::Could not download $1"
+          }
+          fetch dbip-city-lite
+          fetch dbip-asn-lite
+
+      - name: Crawl the Bitcoin network
+        env:
+          CRAWL_SECONDS: "1200"
+          CONCURRENCY: "400"
+        run: python crawler/crawl.py
+
+      - name: Save history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/history.json
+          git commit -m "Update node history" || echo "No history change"
+          git pull --rebase --autostash || true
+          git push || echo "::warning::Could not push history"
+
+      - name: Build site
+        run: |
+          mkdir -p _site/data
+          cp index.html _site/
+          cp data/latest.json data/history.json _site/data/
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
