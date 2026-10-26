@@ -356,6 +356,58 @@ def build_rows(reachable):
     return rows
 
 
+def point_time(point):
+    return point[0] if isinstance(point, list) else point.get("t", 0)
+
+
+def merge_points(*lists):
+    """Union of history lists, one point per timestamp, oldest first."""
+    by_time = {}
+    for points in lists:
+        for p in points:
+            t = point_time(p)
+            if t and (t not in by_time or isinstance(p, dict)):  # prefer the richer format
+                by_time[t] = p
+    return [by_time[t] for t in sorted(by_time)]
+
+
+def parse_history(text):
+    """Parse history.json, recovering from a Git merge conflict instead of losing data.
+
+    A conflicted file looks like:  <<<<<<< HEAD / [..] / ======= / [..] / >>>>>>> abc
+    Both sides are valid JSON lines, so we keep every point from both."""
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        pass
+    sides = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            try:
+                sides.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    if sides:
+        print(f"  history.json had a merge conflict - recovered {len(sides)} versions")
+    return merge_points(*sides)
+
+
+def read_history(path):
+    try:
+        return parse_history(Path(path).read_text())
+    except FileNotFoundError:
+        return []
+
+
+def merge_history_files(theirs, mine, out):
+    """Used by the workflow: combine the repo's newest history with this run's."""
+    merged = compact_history(merge_points(read_history(theirs), read_history(mine)), int(time.time()))
+    Path(out).write_text(json.dumps(merged, separators=(",", ":")))
+    print(f"Merged history: {len(merged)} points")
+
+
 def compact_history(history, now):
     """Keep every point from the last week; older points thin out to one per
     3-hour bucket. Nothing is ever dropped completely, so long-term trends survive
@@ -422,10 +474,7 @@ def main():
     (DATA_DIR / "latest.json").write_text(json.dumps(snapshot, separators=(",", ":")))
 
     history_file = DATA_DIR / "history.json"
-    try:
-        history = json.loads(history_file.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        history = []
+    history = read_history(history_file)
     if rows:  # never record an empty crawl (e.g. network failure) as "0 nodes"
         # t=time, n=nodes, h=height, s=in sync, k=Knots nodes, f=full nodes,
         # c=number of countries, cc=nodes per country (top 25)
@@ -442,4 +491,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) == 5 and sys.argv[1] == "--merge-history":
+        merge_history_files(*sys.argv[2:])
+    else:
+        main()
